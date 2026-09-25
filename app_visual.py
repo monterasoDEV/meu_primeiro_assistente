@@ -12,13 +12,13 @@ from datetime import datetime, timedelta
 from PIL import Image
 from google import genai
 from google.genai import types
+from supabase import create_client
 
 # ==========================================
 # 1. Configuração da Página Web
 # ==========================================
-st.set_page_config(page_title="Tutor CIn - Lucas", page_icon="💻", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Tutor CIn na Nuvem", page_icon="💻", layout="wide", initial_sidebar_state="expanded")
 
-# --- Estilo customizado (tema "terminal de programador") ---
 CSS_CUSTOMIZADO = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&display=swap');
@@ -59,27 +59,53 @@ CSS_CUSTOMIZADO = """
 """
 st.markdown(CSS_CUSTOMIZADO, unsafe_allow_html=True)
 
-# PREPARAÇÃO PARA HOSPEDAGEM GRATUITA (STREAMLIT CLOUD)
-# O código tenta ler a chave dos Secrets (seguro). Se não encontrar (no seu PC local), usa a chave fixa.
+# ==========================================
+# 2. Inicialização de APIs (Gemini e Supabase)
+# ==========================================
 try:
-    API_KEY = st.secrets["GEMINI_API_KEY"]
+    API_KEY = st.secrets["GEMINI_API_KEY"].strip()
+    SUPABASE_URL = st.secrets["SUPABASE_URL"].strip().strip('"').strip("'")
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"].strip().strip('"').strip("'")
 except KeyError:
-    st.error("⚠️ Chave da API do Gemini não configurada nos Secrets do Streamlit.")
+    st.error("⚠️ As chaves da API do Gemini ou do Supabase não estão configuradas nos Secrets.")
     st.stop()
 
 @st.cache_resource
-def get_client():
+def get_gemini_client():
     return genai.Client(api_key=API_KEY)
 
-client = get_client()
+@st.cache_resource
+def get_supabase_client():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+client = get_gemini_client()
+supabase = get_supabase_client()
 
 # ==========================================
-# 2. Funções Base e Sistema de Arquivos
+# 3. Barreira de Login (Autenticação Simples)
 # ==========================================
-FICHEIRO_MEMORIA = "memoria_assistente.json"
-FICHEIRO_PONTOS = "pontos_assistente.json"
-FICHEIRO_FLASHCARDS = "baralho_anki.json"
-FICHEIRO_HISTORICO = "historico_revisoes.json"
+if "usuario" not in st.session_state:
+    st.session_state.usuario = None
+
+if st.session_state.usuario is None:
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.title("🔒 Acesso ao Tutor CIn")
+        st.info("Insere o teu identificador de aluno para carregar os teus flashcards privados na nuvem.")
+        username = st.text_input("Qual o teu nome de utilizador? (ex: lucas_cin)")
+        if st.button("Entrar no Sistema", use_container_width=True, type="primary"):
+            if username.strip():
+                st.session_state.usuario = username.strip()
+                st.rerun()
+    st.stop()  # Impede a execução do resto do código se não estiver autenticado
+
+# ==========================================
+# 4. Funções Base e Sistema de Arquivos Locais Isolados
+# ==========================================
+# Ficheiros locais agora são isolados por utilizador para que históricos não se misturem
+FICHEIRO_MEMORIA = f"memoria_{st.session_state.usuario}.json"
+FICHEIRO_PONTOS = f"pontos_{st.session_state.usuario}.json"
+FICHEIRO_HISTORICO = f"historico_{st.session_state.usuario}.json"
 
 PASTA_BACKUPS = "backups"
 MAX_BACKUPS = 10
@@ -87,39 +113,7 @@ MAX_BACKUPS = 10
 PALETA_CORES_DECK = ["#6C5CE7", "#00B894", "#0984E3", "#E17055", "#FDCB6E", "#E84393", "#00CEC9", "#D63031", "#55A3FF", "#26DE81"]
 PALETA_ICONES_DECK = ["📘", "📗", "📙", "📕", "📓", "📔", "📒", "📚", "🧠", "💡"]
 
-# --- Backup automático + gravação atômica ---
-def _criar_backup(caminho):
-    """Guarda uma cópia datada do arquivo antes de sobrescrevê-lo, mantendo só as MAX_BACKUPS mais recentes."""
-    if not os.path.exists(caminho):
-        return
-    os.makedirs(PASTA_BACKUPS, exist_ok=True)
-    nome_base = os.path.basename(caminho)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    destino = os.path.join(PASTA_BACKUPS, f"{timestamp}__{nome_base}")
-    try:
-        shutil.copy2(caminho, destino)
-    except Exception:
-        return
-    relacionados = sorted(f for f in os.listdir(PASTA_BACKUPS) if f.endswith(f"__{nome_base}"))
-    excedente = len(relacionados) - MAX_BACKUPS
-    for antigo in relacionados[:max(0, excedente)]:
-        try:
-            os.remove(os.path.join(PASTA_BACKUPS, antigo))
-        except Exception:
-            pass
-
-def _backup_mais_recente(caminho):
-    if not os.path.isdir(PASTA_BACKUPS):
-        return None
-    nome_base = os.path.basename(caminho)
-    relacionados = sorted(f for f in os.listdir(PASTA_BACKUPS) if f.endswith(f"__{nome_base}"))
-    return os.path.join(PASTA_BACKUPS, relacionados[-1]) if relacionados else None
-
 def guardar_json(caminho, dados, versionar=False):
-    """Gravação atômica: escreve num .tmp e só troca pelo arquivo real no final,
-    então uma queda de energia ou fechamento abrupto do app nunca deixa o arquivo pela metade."""
-    if versionar:
-        _criar_backup(caminho)
     tmp = caminho + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(dados, f, ensure_ascii=False, indent=4)
@@ -131,16 +125,6 @@ def carregar_json(caminho, default):
             with open(caminho, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            backup = _backup_mais_recente(caminho)
-            if backup:
-                try:
-                    with open(backup, "r", encoding="utf-8") as f:
-                        dados = json.load(f)
-                    st.session_state.setdefault("avisos_recuperacao", []).append(os.path.basename(caminho))
-                    return dados
-                except Exception:
-                    pass
-            st.session_state.setdefault("avisos_recuperacao", []).append(f"{os.path.basename(caminho)} (sem backup disponível)")
             return default
     return default
 
@@ -213,7 +197,7 @@ def gerar_heatmap_html(historico, semanas=13):
         contagem[d] = contagem.get(d, 0) + 1
 
     inicio = hoje - timedelta(weeks=semanas - 1)
-    offset_domingo = (inicio.weekday() + 1) % 7  # weekday(): seg=0 ... dom=6
+    offset_domingo = (inicio.weekday() + 1) % 7 
     inicio -= timedelta(days=offset_domingo)
 
     def cor_intensidade(q):
@@ -256,35 +240,36 @@ def obter_conquistas(historico, streak, xp):
     ]
 
 # ==========================================
-# 3. Inicialização de Estado
+# 5. Funções de Comunicação com Supabase
 # ==========================================
+def upsert_cartao(cartao):
+    dados = cartao.copy()
+    dados["username"] = st.session_state.usuario
+    supabase.table("flashcards").upsert(dados).execute()
+
+def deletar_cartao(id_cartao):
+    supabase.table("flashcards").delete().eq("id", id_cartao).execute()
+
+# Inicialização do estado e ligação à base de dados
 if "chat_history" not in st.session_state: st.session_state.chat_history = carregar_json(FICHEIRO_MEMORIA, [])
 if "xp" not in st.session_state: st.session_state.xp = carregar_json(FICHEIRO_PONTOS, {"xp": 0}).get("xp", 0)
-if "flashcards" not in st.session_state:
-    st.session_state.flashcards = carregar_json(FICHEIRO_FLASHCARDS, [])
-    _precisa_salvar = False
-    for _c in st.session_state.flashcards:
-        if "id" not in _c:
-            _c["id"] = str(uuid.uuid4())[:8]
-            _precisa_salvar = True
-    if _precisa_salvar:
-        guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards)
-if "cartao_atual_verso" not in st.session_state: st.session_state.cartao_atual_verso = False
 if "historico" not in st.session_state: st.session_state.historico = carregar_json(FICHEIRO_HISTORICO, [])
+if "cartao_atual_verso" not in st.session_state: st.session_state.cartao_atual_verso = False
 
-if st.session_state.get("avisos_recuperacao"):
-    for aviso in st.session_state.avisos_recuperacao:
-        st.warning(f"⚠️ '{aviso}' estava corrompido ou ilegível — recuperado a partir do backup mais recente disponível.", icon="🛠️")
-    st.session_state.avisos_recuperacao = []
+# Carregar flashcards exclusivos do utilizador logado diretamente do Supabase
+if "flashcards_carregados" not in st.session_state:
+    resposta = supabase.table("flashcards").select("*").eq("username", st.session_state.usuario).execute()
+    st.session_state.flashcards = resposta.data
+    st.session_state.flashcards_carregados = True
 
 nivel = (st.session_state.xp // 100) + 1
 xp_progresso = st.session_state.xp % 100
 
 # ==========================================
-# 4. Algoritmo SM-2 (Revisão Espaçada)
+# 6. Algoritmo SM-2 (Revisão Espaçada)
 # ==========================================
 def avaliar_cartao(cartao, qualidade):
-    repeticoes, ef, intervalo = cartao.get("repeticoes", 0), cartao.get("ease_factor", 2.5), cartao.get("intervalo", 0)
+    repeticoes, ef, intervalo = cartao.get("repeticoes", 0), float(cartao.get("ease_factor", 2.5)), cartao.get("intervalo", 0)
     if qualidade >= 3:
         if repeticoes == 0: intervalo = 1
         elif repeticoes == 1: intervalo = 6
@@ -300,10 +285,14 @@ def avaliar_cartao(cartao, qualidade):
     return cartao
 
 # ==========================================
-# 5. Barra Lateral (Painel de Controlo)
+# 7. Barra Lateral (Painel de Controlo)
 # ==========================================
 with st.sidebar:
-    st.title("💻 CIn Tutor Workspace")
+    st.title(f"💻 Perfil: {st.session_state.usuario}")
+    
+    if st.button("🚪 Terminar Sessão", type="secondary"):
+        st.session_state.clear()
+        st.rerun()
 
     with st.container(border=True):
         st.markdown(f"### 👨‍💻 Dev Nível {nivel}")
@@ -341,44 +330,8 @@ with st.sidebar:
             st.toast("Console limpo com sucesso!", icon="🧹")
             st.rerun()
 
-        st.divider()
-        st.caption("💾 Backup completo (cartões + histórico + XP + chat)")
-        _backup_completo = {
-            "exportado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "flashcards": st.session_state.flashcards,
-            "historico": st.session_state.historico,
-            "xp": st.session_state.xp,
-            "chat_history": st.session_state.chat_history,
-        }
-        st.download_button(
-            "📥 Baixar backup (.json)",
-            data=json.dumps(_backup_completo, ensure_ascii=False, indent=2),
-            file_name=f"backup_tutorcin_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        ficheiro_restauro = st.file_uploader("Restaurar backup (.json)", type=["json"], key="upload_restauro")
-        if ficheiro_restauro:
-            confirmar_restauro = st.checkbox("Entendo que isso substitui os dados atuais.")
-            if st.button("♻️ Restaurar agora", disabled=not confirmar_restauro, use_container_width=True):
-                try:
-                    dados_restaurados = json.load(ficheiro_restauro)
-                    st.session_state.flashcards = dados_restaurados.get("flashcards", [])
-                    st.session_state.historico = dados_restaurados.get("historico", [])
-                    st.session_state.xp = dados_restaurados.get("xp", 0)
-                    st.session_state.chat_history = dados_restaurados.get("chat_history", [])
-                    guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards, versionar=True)
-                    guardar_json(FICHEIRO_HISTORICO, st.session_state.historico, versionar=True)
-                    guardar_json(FICHEIRO_PONTOS, {"xp": st.session_state.xp})
-                    guardar_json(FICHEIRO_MEMORIA, st.session_state.chat_history)
-                    st.toast("Backup restaurado com sucesso!", icon="♻️")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Arquivo inválido: {e}")
-
 # ==========================================
-# 6. Configuração do Gemini (CÉREBRO UFPE)
+# 8. Configuração do Gemini (CÉREBRO UFPE)
 # ==========================================
 instrucao_base = """Você é um tutor de excelência em Ciência da Computação. 
 O aluno chama-se Lucas, está no 1º período de Ciência da Computação no CIn da UFPE.
@@ -397,7 +350,7 @@ if ("pdf_atual" not in st.session_state or st.session_state.pdf_atual != ficheir
     st.session_state.gemini_chat = client.chats.create(model="gemini-3.1-flash-lite", config=config, history=historico_gemini)
 
 # ==========================================
-# 7. MÓDULO 1: TERMINAL CIN (CHAT)
+# 9. MÓDULO 1: TERMINAL CIN (CHAT)
 # ==========================================
 if modo_app == "💬 Terminal CIn (Chat)":
     st.title("👨‍💻 Terminal de Estudos CIn/UFPE")
@@ -417,7 +370,7 @@ if modo_app == "💬 Terminal CIn (Chat)":
     elif btn_reforco:
         cartoes_fracos = obter_cartoes_fracos(st.session_state.flashcards)
         if not cartoes_fracos:
-            st.toast("O seu desempenho está excelente! Não há falhas críticas registadas.", icon="🏆")
+            st.toast("O teu desempenho está excelente! Não há falhas críticas registadas.", icon="🏆")
         else:
             conceitos_fracos = [c['frente'] for c in cartoes_fracos[:5]]
             prompt_enviado = f"Estou com muita dificuldade nestes conceitos cruciais: {conceitos_fracos}. Gera um mini-teste prático e focado para me forçar a aplicar estes conceitos. Faz perguntas desafiadoras (nível CIn/UFPE) e não me dês a resposta até eu tentar resolver."
@@ -448,12 +401,28 @@ if modo_app == "💬 Terminal CIn (Chat)":
                         if match:
                             novos_cartoes = json.loads(match.group(0))
                             hoje = datetime.now().strftime("%Y-%m-%d")
+                            
+                            novos_db = []
                             for c in novos_cartoes:
-                                st.session_state.flashcards.append({"id": str(uuid.uuid4())[:8], "frente": c["frente"], "verso": c["verso"], "deck": nome_baralho, "repeticoes": 0, "ease_factor": 2.5, "intervalo": 0, "proxima_revisao": hoje})
+                                novo = {"id": str(uuid.uuid4())[:8], "frente": c["frente"], "verso": c["verso"], "deck": nome_baralho, "repeticoes": 0, "ease_factor": 2.5, "intervalo": 0, "proxima_revisao": hoje}
+                                st.session_state.flashcards.append(novo)
+                                
+                                n_db = novo.copy()
+                                n_db["username"] = st.session_state.usuario
+                                novos_db.append(n_db)
+
                                 if gerar_inversos and not usar_lacunas:
-                                    st.session_state.flashcards.append({"id": str(uuid.uuid4())[:8], "frente": c["verso"], "verso": c["frente"], "deck": nome_baralho, "repeticoes": 0, "ease_factor": 2.5, "intervalo": 0, "proxima_revisao": hoje})
-                            guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards, versionar=True)
-                            st.success(f"**Sucesso!** Cartões inseridos na BD do baralho '{nome_baralho}'.")
+                                    inverso = {"id": str(uuid.uuid4())[:8], "frente": c["verso"], "verso": c["frente"], "deck": nome_baralho, "repeticoes": 0, "ease_factor": 2.5, "intervalo": 0, "proxima_revisao": hoje}
+                                    st.session_state.flashcards.append(inverso)
+                                    
+                                    inv_db = inverso.copy()
+                                    inv_db["username"] = st.session_state.usuario
+                                    novos_db.append(inv_db)
+                            
+                            if novos_db:
+                                supabase.table("flashcards").insert(novos_db).execute()
+
+                            st.success(f"**Sucesso!** Cartões guardados na nuvem do baralho '{nome_baralho}'.")
                         else:
                             st.error("Falha ao gerar o JSON da base de dados.")
                     else:
@@ -465,10 +434,10 @@ if modo_app == "💬 Terminal CIn (Chat)":
                 except Exception as e: st.error(f"Erro de Execução: {e}")
 
 # ==========================================
-# 8. MÓDULO 2: MEMÓRIA RAM (ANKI) - UI DINÂMICA
+# 10. MÓDULO 2: MEMÓRIA RAM (ANKI) - UI DINÂMICA
 # ==========================================
 elif modo_app == "🗂️ Memória RAM (Anki)":
-    st.title("🗂️ Base de Dados de Conhecimento (SRS)")
+    st.title("🗂️ Base de Dados de Conhecimento na Nuvem")
 
     hoje_str = datetime.now().strftime("%Y-%m-%d")
     streak_atual = calcular_streak(st.session_state.historico)
@@ -484,7 +453,6 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
         with col_streak:
             st.metric("🔥 Streak", f"{streak_atual} dia(s)")
 
-        # troca de deck limpa a resposta revelada do cartão anterior
         if st.session_state.get("_ultimo_deck_revisar") != deck_selecionado:
             st.session_state.cartao_atual_verso = False
             st.session_state["_ultimo_deck_revisar"] = deck_selecionado
@@ -492,6 +460,7 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
         cartoes_filtrados = [c for c in st.session_state.flashcards if deck_selecionado == "Todos" or c.get("deck", "Geral") == deck_selecionado]
         novos = len([c for c in cartoes_filtrados if c.get("repeticoes", 0) == 0])
         pendentes_hoje = [c for c in cartoes_filtrados if c.get("proxima_revisao", hoje_str) <= hoje_str]
+        
         if deck_selecionado == "Todos":
             revisados_hoje = len([h for h in st.session_state.historico if h["data"] == hoje_str])
         else:
@@ -541,8 +510,11 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
 
                     def atualizar_e_avancar(qualidade, cor_toast):
                         idx = indice_por_id(cartao_atual["id"])
-                        st.session_state.flashcards[idx] = avaliar_cartao(cartao_atual, qualidade)
-                        guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards, versionar=True)
+                        cartao_atualizado = avaliar_cartao(cartao_atual, qualidade)
+                        st.session_state.flashcards[idx] = cartao_atualizado
+                        
+                        # Atualiza no Supabase
+                        upsert_cartao(cartao_atualizado)
 
                         st.session_state.historico.append({"data": hoje_str, "deck": deck_nome, "qualidade": qualidade})
                         guardar_json(FICHEIRO_HISTORICO, st.session_state.historico, versionar=True)
@@ -571,14 +543,15 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
                 enviado = st.form_submit_button("💾 Salvar Cartão", type="primary")
                 if enviado:
                     if nova_frente and novo_verso:
-                        st.session_state.flashcards.append({
+                        novo = {
                             "id": str(uuid.uuid4())[:8],
                             "frente": nova_frente, "verso": novo_verso, "deck": novo_deck or "Geral",
                             "repeticoes": 0, "ease_factor": 2.5, "intervalo": 0,
                             "proxima_revisao": hoje_str
-                        })
-                        guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards, versionar=True)
-                        st.toast("Cartão adicionado!", icon="✅")
+                        }
+                        st.session_state.flashcards.append(novo)
+                        upsert_cartao(novo)
+                        st.toast("Cartão guardado na nuvem!", icon="✅")
                         st.rerun()
                     else:
                         st.warning("Preencha pergunta e resposta antes de salvar.")
@@ -596,30 +569,35 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
                         st.dataframe(df_import.head(5), use_container_width=True)
                         deck_padrao_import = st.text_input("Deck para linhas sem essa coluna", value="Importado")
                         if st.button("✅ Confirmar importação", use_container_width=True):
-                            novos_n = 0
+                            novos_db = []
                             for _, linha in df_import.iterrows():
                                 frente_i = str(linha[colunas["frente"]]).strip()
                                 verso_i = str(linha[colunas["verso"]]).strip()
                                 if not frente_i or not verso_i or frente_i.lower() == "nan" or verso_i.lower() == "nan":
                                     continue
-                                if "deck" in colunas and pd.notna(linha[colunas["deck"]]):
-                                    deck_i = str(linha[colunas["deck"]]).strip()
-                                else:
-                                    deck_i = deck_padrao_import
-                                st.session_state.flashcards.append({
+                                
+                                deck_i = str(linha[colunas["deck"]]).strip() if "deck" in colunas and pd.notna(linha[colunas["deck"]]) else deck_padrao_import
+                                
+                                novo = {
                                     "id": str(uuid.uuid4())[:8],
                                     "frente": frente_i, "verso": verso_i, "deck": deck_i or "Importado",
                                     "repeticoes": 0, "ease_factor": 2.5, "intervalo": 0,
                                     "proxima_revisao": hoje_str
-                                })
-                                novos_n += 1
-                            guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards, versionar=True)
-                            st.toast(f"{novos_n} cartão(ões) importado(s)!", icon="📤")
+                                }
+                                st.session_state.flashcards.append(novo)
+                                
+                                n_db = novo.copy()
+                                n_db["username"] = st.session_state.usuario
+                                novos_db.append(n_db)
+                                
+                            if novos_db:
+                                supabase.table("flashcards").insert(novos_db).execute()
+                            st.toast(f"{len(novos_db)} cartão(ões) importado(s) para a nuvem!", icon="📤")
                             st.rerun()
                 except Exception as e:
                     st.error(f"Não consegui ler esse CSV: {e}")
 
-        with st.expander("🛠️ Ferramentas de Deck (renomear, mesclar ou excluir em massa)"):
+        with st.expander("🛠️ Ferramentas de Deck (renomear ou excluir em massa)"):
             decks_atuais = sorted(set(c.get("deck", "Geral") for c in st.session_state.flashcards))
             if not decks_atuais:
                 st.caption("Nenhum deck ainda.")
@@ -632,13 +610,17 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
                 col_renomear, col_excluir_deck = st.columns(2)
                 if col_renomear.button("✏️ Aplicar novo nome", use_container_width=True):
                     if novo_nome_deck.strip():
+                        # Atualiza no Supabase em massa
+                        supabase.table("flashcards").update({"deck": novo_nome_deck.strip()}).eq("deck", deck_alvo).eq("username", st.session_state.usuario).execute()
+                        
+                        # Atualiza estado local
                         for c in st.session_state.flashcards:
                             if c.get("deck", "Geral") == deck_alvo:
                                 c["deck"] = novo_nome_deck.strip()
-                        guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards, versionar=True)
+                                
                         for _chave in ("deck_gerenciar", "deck_ferramenta", "deck_revisar"):
                             st.session_state.pop(_chave, None)
-                        st.toast(f"Deck atualizado para '{novo_nome_deck.strip()}'.", icon="✏️")
+                        st.toast(f"Deck atualizado na nuvem para '{novo_nome_deck.strip()}'.", icon="✏️")
                         st.rerun()
 
                 chave_confirma_deck = f"confirma_exclusao_deck_{deck_alvo}"
@@ -650,12 +632,15 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
                     st.warning(f"Isso vai excluir os {qtd_no_deck} cartões de '{deck_alvo}'. Confirma?")
                     col_cd1, col_cd2 = st.columns(2)
                     if col_cd1.button("✅ Sim, excluir deck", key="conf_sim_deck", use_container_width=True):
+                        # Apaga em massa no Supabase
+                        supabase.table("flashcards").delete().eq("deck", deck_alvo).eq("username", st.session_state.usuario).execute()
+                        
+                        # Remove localmente
                         st.session_state.flashcards = [c for c in st.session_state.flashcards if c.get("deck", "Geral") != deck_alvo]
-                        guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards, versionar=True)
                         st.session_state.pop(chave_confirma_deck, None)
                         for _chave in ("deck_gerenciar", "deck_ferramenta", "deck_revisar"):
                             st.session_state.pop(_chave, None)
-                        st.toast("Deck excluído.", icon="🗑️")
+                        st.toast("Deck excluído na nuvem.", icon="🗑️")
                         st.rerun()
                     if col_cd2.button("↩️ Cancelar", key="conf_nao_deck", use_container_width=True):
                         st.session_state.pop(chave_confirma_deck, None)
@@ -675,7 +660,6 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
             termo = busca.lower()
             resultado = [c for c in resultado if termo in c["frente"].lower() or termo in c["verso"].lower()]
 
-        # filtro mudou -> volta pra página 1
         chave_filtro_atual = (busca, filtro_deck_g)
         if st.session_state.get("_ultimo_filtro_gerenciar") != chave_filtro_atual:
             st.session_state.pagina_gerenciar = 1
@@ -719,12 +703,12 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
                 novo_v = st.text_area("Resposta", value=cartao["verso"], key=f"verso_{cid}")
 
                 col_salvar, col_excluir = st.columns(2)
-                if col_salvar.button("💾 Salvar alterações", key=f"salvar_{cid}", use_container_width=True):
+                if col_salvar.button("💾 Guardar alterações", key=f"salvar_{cid}", use_container_width=True):
                     idx = indice_por_id(cid)
                     st.session_state.flashcards[idx]["frente"] = nova_f
                     st.session_state.flashcards[idx]["verso"] = novo_v
-                    guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards, versionar=True)
-                    st.toast("Cartão atualizado!", icon="✏️")
+                    upsert_cartao(st.session_state.flashcards[idx])
+                    st.toast("Cartão atualizado na nuvem!", icon="✏️")
                     st.rerun()
 
                 chave_confirma = f"confirma_exclusao_{cid}"
@@ -733,15 +717,15 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
                         st.session_state[chave_confirma] = True
                         st.rerun()
                 else:
-                    st.warning("Tem certeza que quer excluir este cartão? Essa ação não pode ser desfeita.")
+                    st.warning("Tens a certeza de que queres excluir este cartão permanentemente?")
                     col_conf1, col_conf2 = st.columns(2)
                     if col_conf1.button("✅ Sim, excluir", key=f"confirma_sim_{cid}", use_container_width=True):
                         idx = indice_por_id(cid)
                         if idx is not None:
                             st.session_state.flashcards.pop(idx)
-                            guardar_json(FICHEIRO_FLASHCARDS, st.session_state.flashcards, versionar=True)
+                            deletar_cartao(cid)
                         st.session_state.pop(chave_confirma, None)
-                        st.toast("Cartão excluído.", icon="🗑️")
+                        st.toast("Cartão apagado da nuvem.", icon="🗑️")
                         st.rerun()
                     if col_conf2.button("↩️ Cancelar", key=f"confirma_nao_{cid}", use_container_width=True):
                         st.session_state.pop(chave_confirma, None)
@@ -782,9 +766,3 @@ elif modo_app == "🗂️ Memória RAM (Anki)":
                 f"<b>{conquista['nome']}</b><br><span>{conquista['desc']}</span>"
                 f"</div>", unsafe_allow_html=True
             )
-
-        cartoes_fracos = obter_cartoes_fracos(st.session_state.flashcards)
-        if cartoes_fracos:
-            st.markdown("#### ⚠️ Cartões em dificuldade")
-            for c in cartoes_fracos[:10]:
-                st.markdown(f"- **{c.get('deck', 'Geral')}** — {c['frente'][:80]}")
