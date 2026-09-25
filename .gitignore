@@ -1,0 +1,11 @@
+# Segredos e Configurações Locais
+.streamlit/secrets.toml
+
+# Dados locais do utilizador (Chat, XP e Baralho Anki)
+memoria_assistente.json
+pontos_assistente.json
+baralho_anki.json
+
+# Cache do Python
+__pycache__/
+*.pyc
