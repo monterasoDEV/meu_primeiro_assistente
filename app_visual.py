@@ -10,8 +10,11 @@ import shutil
 import pandas as pd
 from datetime import datetime, timedelta
 from PIL import Image
-import google.generativeai as genai
+
+# Correção fundamental: Usar apenas a nova biblioteca 'google-genai'
+from google import genai
 from google.genai import types
+
 from supabase import create_client
 
 # ==========================================
@@ -71,9 +74,12 @@ except KeyError:
     st.stop()
 
 @st.cache_resource
-
 def get_gemini_client():
-    # O SDK lê automaticamente o 'GEMINI_API_KEY' dos Secrets do Streamlit
+    # Garante que o SDK apanha a chave dos secrets do Streamlit de forma segura
+    if "GEMINI_API_KEY" in st.secrets:
+        os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+    
+    # Inicializa o cliente com a nova biblioteca
     return genai.Client()
 
 @st.cache_resource
@@ -104,7 +110,6 @@ if st.session_state.usuario is None:
 # ==========================================
 # 4. Funções Base e Sistema de Arquivos Locais Isolados
 # ==========================================
-# Ficheiros locais agora são isolados por utilizador para que históricos não se misturem
 FICHEIRO_MEMORIA = f"memoria_{st.session_state.usuario}.json"
 FICHEIRO_PONTOS = f"pontos_{st.session_state.usuario}.json"
 FICHEIRO_HISTORICO = f"historico_{st.session_state.usuario}.json"
@@ -335,12 +340,7 @@ with st.sidebar:
 # ==========================================
 # 8. Configuração do Gemini (CÉREBRO UFPE)
 # ==========================================
-instrucao_base = """Você é um tutor de excelência em Ciência da Computação. 
-O aluno chama-se Lucas, está no 1º período de Ciência da Computação no CIn da UFPE.
-Regras:
-1. NUNCA dê o código ou a resposta pronta matematicamente. Guie-o na lógica.
-2. Use analogias de computação.
-3. Foque em eficiência (Big-O), boas práticas e fundamentos fortes."""
+instrucao_base = "Você é um tutor de excelência em Ciência da Computação. O aluno chama-se Lucas, está no 1º período de Ciência da Computação no CIn da UFPE. Regras: 1. NUNCA dê o código ou a resposta pronta matematicamente. Guie-o na lógica. 2. Use analogias de computação. 3. Foque em eficiência (Big-O), boas práticas e fundamentos fortes."
 
 instrucao_sistema = instrucao_base + f"\n\nMATERIAL DE APOIO:\n{contexto_pdf[:20000]}" if contexto_pdf else instrucao_base
 historico_gemini = [types.Content(role="user" if m["role"] == "user" else "model", parts=[types.Part.from_text(text=m["content"])]) for m in st.session_state.chat_history]
