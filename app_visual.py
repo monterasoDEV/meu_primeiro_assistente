@@ -10,7 +10,7 @@ import shutil
 import pandas as pd
 from datetime import datetime, timedelta
 from PIL import Image
-from google import genai
+import google.generativeai as genai
 from google.genai import types
 from supabase import create_client
 
