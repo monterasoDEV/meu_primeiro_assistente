@@ -71,8 +71,10 @@ except KeyError:
     st.stop()
 
 @st.cache_resource
+
 def get_gemini_client():
-    return genai.Client(api_key=API_KEY)
+    # O SDK lê automaticamente o 'GEMINI_API_KEY' dos Secrets do Streamlit
+    return genai.Client()
 
 @st.cache_resource
 def get_supabase_client():
