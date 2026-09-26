@@ -2,3 +2,4 @@ streamlit
 google-generativeai
 supabase
 pandas
+PyPDF2
